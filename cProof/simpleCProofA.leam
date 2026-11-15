@@ -1,0 +1,373 @@
+/-!
+# Verified compilation v2: C-like language → x86-64 subset
+
+Source ("C with goto"):
+    x = a;   x = a + b;   x = a - b;   x = a / b;
+    if (a != 0) goto L;   print(a);
+Operands `a`,`b` are variables or 64-bit constants. +,- wrap (like -fwrapv).
+Signed `/` truncates toward zero; division by 0 and INT_MIN / -1 are
+undefined behaviour (the source semantics gets *stuck* with `ub`).
+
+Target: x86-64 subset, with `cqo; idiv`, and `print` as an external call
+(`mov rdi, a; call print_i64`) that appends rdi to an output log.
+Every source instruction compiles to exactly 5 machine instructions.
+-/
+
+abbrev W := BitVec 64
+
+/-! ## Arithmetic helpers (shared meaning of signed division) -/
+
+def fits (q : Int) : Prop := -2^63 ≤ q ∧ q < 2^63
+instance (q : Int) : Decidable (fits q) := inferInstanceAs (Decidable (_ ∧ _))
+
+/-- C semantics of `a / b`: truncating, `none` = undefined behaviour. -/
+def divW (a b : W) : Option W :=
+  if b.toInt = 0 ∨ ¬ fits (a.toInt.tdiv b.toInt) then none
+  else some (BitVec.ofInt 64 (a.toInt.tdiv b.toInt))
+
+/-- x86 `cqo`: rdx := sign-extension of rax. -/
+def cqoW (x : W) : W := if x.msb then -1 else 0
+
+/-- x86 `idiv d`: divides the signed 128-bit value rdx:rax; (quotient, remainder);
+    `none` = #DE fault (divisor 0 or quotient does not fit in 64 bits). -/
+def idivW (hi lo d : W) : Option (W × W) :=
+  let n : Int := hi.toInt * 2^64 + (lo.toNat : Int)
+  if d.toInt = 0 ∨ ¬ fits (n.tdiv d.toInt) then none
+  else some (BitVec.ofInt 64 (n.tdiv d.toInt), BitVec.ofInt 64 (n.tmod d.toInt))
+
+/-! ## Source language -/
+
+inductive Atom where
+  | const (n : W)
+  | var (x : Nat)
+
+inductive Expr where
+  | atom (a : Atom)
+  | add (a b : Atom)
+  | sub (a b : Atom)
+  | div (a b : Atom)
+
+inductive Instr where
+  | assign (x : Nat) (e : Expr)     -- x = e;
+  | ifnz (a : Atom) (target : Nat)  -- if (a != 0) goto target;
+  | print (a : Atom)                -- print(a);
+
+structure SState where
+  env : Nat → W
+  pc  : Nat
+  out : List W
+
+def Atom.eval (env : Nat → W) : Atom → W
+  | .const n => n
+  | .var x   => env x
+
+/-- `none` = undefined behaviour. -/
+def Expr.eval (env : Nat → W) : Expr → Option W
+  | .atom a  => some (a.eval env)
+  | .add a b => some (a.eval env + b.eval env)
+  | .sub a b => some (a.eval env - b.eval env)
+  | .div a b => divW (a.eval env) (b.eval env)
+
+def Function.upd (f : Nat → W) (x : Nat) (v : W) : Nat → W :=
+  fun y => if y = x then v else f y
+
+inductive SStep where
+  | halt                 -- pc ran off the end
+  | ub                   -- undefined behaviour
+  | next (s : SState)
+
+def sstep (p : List Instr) (s : SState) : SStep :=
+  match p[s.pc]? with
+  | none => .halt
+  | some (.assign x e) =>
+    match e.eval s.env with
+    | none   => .ub
+    | some v => .next ⟨Function.upd s.env x v, s.pc + 1, s.out⟩
+  | some (.ifnz a t) =>
+    .next ⟨s.env, if a.eval s.env ≠ 0 then t else s.pc + 1, s.out⟩
+  | some (.print a) =>
+    .next ⟨s.env, s.pc + 1, s.out ++ [a.eval s.env]⟩
+
+/-- Source run from `s` terminates normally (no UB) in `s'`. -/
+inductive SHalts (p : List Instr) : SState → SState → Prop
+  | done {s} : sstep p s = .halt → SHalts p s s
+  | step {s s₁ s₂} : sstep p s = .next s₁ → SHalts p s₁ s₂ → SHalts p s s₂
+
+/-! ## x86-64 subset -/
+
+inductive Reg | rax | rcx | rdx | rdi
+
+inductive AInstr where
+  | movImm   (r : Reg) (n : W)
+  | movLoad  (r : Reg) (slot : Nat)
+  | movStore (slot : Nat) (r : Reg)
+  | add      (d s : Reg)
+  | sub      (d s : Reg)
+  | test     (r : Reg)
+  | jnz      (target : Nat)
+  | cqo
+  | idiv     (r : Reg)
+  | callPrint            -- call print_i64(rdi): logs rdi; caller-saved regs clobbered
+  | nop
+
+structure AState where
+  rax : W
+  rcx : W
+  rdx : W
+  rdi : W
+  zf  : Bool
+  mem : Nat → W
+  out : List W
+  pc  : Nat
+
+def AState.get (a : AState) : Reg → W
+  | .rax => a.rax | .rcx => a.rcx | .rdx => a.rdx | .rdi => a.rdi
+
+def AState.set (a : AState) : Reg → W → AState
+  | .rax, v => { a with rax := v }
+  | .rcx, v => { a with rcx := v }
+  | .rdx, v => { a with rdx := v }
+  | .rdi, v => { a with rdi := v }
+
+inductive AStep where
+  | halt
+  | trap                 -- hardware fault (#DE)
+  | next (a : AState)
+
+def astep (code : List AInstr) (a : AState) : AStep :=
+  match code[a.pc]? with
+  | none => .halt
+  | some (.movImm r n)   => .next { a.set r n with pc := a.pc + 1 }
+  | some (.movLoad r s)  => .next { a.set r (a.mem s) with pc := a.pc + 1 }
+  | some (.movStore s r) => .next { a with mem := Function.upd a.mem s (a.get r), pc := a.pc + 1 }
+  | some (.add d s)      => .next { a.set d (a.get d + a.get s) with pc := a.pc + 1 }
+  | some (.sub d s)      => .next { a.set d (a.get d - a.get s) with pc := a.pc + 1 }
+  | some (.test r)       => .next { a with zf := (a.get r == 0), pc := a.pc + 1 }
+  | some (.jnz t)        => .next { a with pc := if a.zf = false then t else a.pc + 1 }
+  | some .cqo            => .next { a with rdx := cqoW a.rax, pc := a.pc + 1 }
+  | some (.idiv r)       =>
+    match idivW a.rdx a.rax (a.get r) with
+    | none        => .trap
+    | some (q, m) => .next { a with rax := q, rdx := m, pc := a.pc + 1 }
+  | some .callPrint      =>
+    .next { a with out := a.out ++ [a.rdi], rax := 0, rcx := 0, rdx := 0, pc := a.pc + 1 }
+  | some .nop            => .next { a with pc := a.pc + 1 }
+
+def asteps (code : List AInstr) : Nat → AState → Option AState
+  | 0,     a => some a
+  | n + 1, a => match astep code a with
+    | .next a' => asteps code n a'
+    | _        => none
+
+/-- Machine run terminates normally (pc falls off the end, no trap). -/
+def AHalts (code : List AInstr) (a a' : AState) : Prop :=
+  ∃ n, asteps code n a = some a' ∧ astep code a' = .halt
+
+/-! ## The compiler -/
+
+def loadAtom (r : Reg) : Atom → AInstr
+  | .const n => .movImm r n
+  | .var x   => .movLoad r x
+
+/-- Every instruction compiles to exactly five machine instructions. -/
+def block : Instr → List AInstr
+  | .assign x (.atom a)  => [loadAtom .rax a, .nop, .nop, .nop, .movStore x .rax]
+  | .assign x (.add a b) => [loadAtom .rax a, loadAtom .rcx b, .add .rax .rcx, .nop, .movStore x .rax]
+  | .assign x (.sub a b) => [loadAtom .rax a, loadAtom .rcx b, .sub .rax .rcx, .nop, .movStore x .rax]
+  | .assign x (.div a b) => [loadAtom .rax a, loadAtom .rcx b, .cqo, .idiv .rcx, .movStore x .rax]
+  | .ifnz a t            => [loadAtom .rax a, .nop, .nop, .test .rax, .jnz (5 * t)]
+  | .print a             => [loadAtom .rdi a, .nop, .nop, .nop, .callPrint]
+
+def compile : List Instr → List AInstr
+  | []      => []
+  | i :: is => block i ++ compile is
+
+/-! ## Proof -/
+
+theorem block_length (i : Instr) : (block i).length = 5 := by
+  cases i with
+  | assign x e => cases e <;> rfl
+  | ifnz a t => rfl
+  | print a => rfl
+
+theorem compile_length (p : List Instr) : (compile p).length = 5 * p.length := by
+  induction p with
+  | nil => rfl
+  | cons i is ih => simp [compile, block_length, ih]; omega
+
+theorem compile_get (p : List Instr) (i : Nat) (ins : Instr) (hi : p[i]? = some ins)
+    (k : Nat) (hk : k < 5) : (compile p)[5 * i + k]? = (block ins)[k]? := by
+  induction p generalizing i with
+  | nil => simp at hi
+  | cons j js ih =>
+    cases i with
+    | zero =>
+      simp at hi; subst hi
+      simp only [compile, Nat.mul_zero, Nat.zero_add]
+      exact List.getElem?_append_left (by rw [block_length]; exact hk)
+    | succ i =>
+      simp only [compile]
+      have : 5 * (i + 1) + k = (block j).length + (5 * i + k) := by
+        rw [block_length]; omega
+      rw [this, List.getElem?_append_right (by omega)]
+      simp only [Nat.add_sub_cancel_left]
+      exact ih i (by simpa using hi)
+
+/-! ### Division: `cqo; idiv` implements C's `/` -/
+
+theorem cqo_toInt (x : W) : (cqoW x).toInt * 2^64 + (x.toNat : Int) = x.toInt := by
+  have h1 : (-1 : W).toInt = -1 := by decide
+  have h0 : (0 : W).toInt = 0 := by decide
+  have hx := BitVec.toInt_eq_msb_cond x
+  by_cases hm : x.msb = true
+  · simp only [cqoW, hm, if_true, h1] at hx ⊢
+    simp at hx ⊢; omega
+  · simp only [cqoW, hm, if_false, h0] at hx ⊢
+    simp at hx ⊢; omega
+
+theorem idivW_of_divW (a b v : W) (h : divW a b = some v) :
+    ∃ r, idivW (cqoW a) a b = some (v, r) := by
+  have key := cqo_toInt a
+  unfold divW at h
+  unfold idivW
+  simp only [key]
+  split at h
+  · simp at h
+  · rename_i hc
+    simp at h
+    exact ⟨BitVec.ofInt 64 (a.toInt.tmod b.toInt), by rw [if_neg hc]; simp [h]⟩
+
+/-! ### Simulation -/
+
+def Rel (s : SState) (a : AState) : Prop :=
+  a.pc = 5 * s.pc ∧ a.mem = s.env ∧ a.out = s.out
+
+theorem sim_step (p : List Instr) (s s' : SState) (a : AState)
+    (hs : sstep p s = .next s') (hr : Rel s a) :
+    ∃ a', asteps (compile p) 5 a = some a' ∧ Rel s' a' := by
+  unfold sstep at hs
+  rcases a with ⟨ra, rc, rd, ri, zf, mem, out, pc⟩
+  obtain ⟨hpc, hmem, hout⟩ := hr
+  simp only at hpc hmem hout
+  subst hpc hmem hout
+  cases hins : p[s.pc]? with
+  | none => simp [hins] at hs
+  | some ins =>
+    have hk : ∀ k, k < 5 → (compile p)[5 * s.pc + k]? = (block ins)[k]? := by
+      intro k hk; exact compile_get p s.pc ins hins k hk
+    have h0 := hk 0 (by omega)
+    have h1 := hk 1 (by omega)
+    have h2 := hk 2 (by omega)
+    have h3 := hk 3 (by omega)
+    have h4 := hk 4 (by omega)
+    rw [hins] at hs
+    cases ins with
+    | assign x e =>
+      cases e with
+      | atom at_ =>
+        simp [Expr.eval] at hs; subst hs
+        cases at_ <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+        simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get] <;> omega
+      | add at1 at2 =>
+        simp [Expr.eval] at hs; subst hs
+        cases at1 <;> cases at2 <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+        simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get] <;> omega
+      | sub at1 at2 =>
+        simp [Expr.eval] at hs; subst hs
+        cases at1 <;> cases at2 <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+        simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get] <;> omega
+      | div at1 at2 =>
+        cases hd : divW (at1.eval s.env) (at2.eval s.env) with
+        | none => simp [Expr.eval, hd] at hs
+        | some v =>
+          simp [Expr.eval, hd] at hs; subst hs
+          obtain ⟨r, hr⟩ := idivW_of_divW _ _ _ hd
+          cases at1 <;> cases at2 <;> simp [Atom.eval] at hr <;>
+          simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+          simp [asteps, astep, h0, h1, h2, h3, h4, hr, Rel, Atom.eval, AState.set, AState.get] <;> omega
+    | ifnz at_ t =>
+      simp at hs; subst hs
+      cases at_ <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+      simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get]
+      all_goals (try split)
+      all_goals (try simp_all)
+      all_goals omega
+    | print at_ =>
+      simp at hs; subst hs
+      cases at_ <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+      simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get] <;> omega
+
+theorem asteps_add (code : List AInstr) (m n : Nat) (a a₁ : AState)
+    (h : asteps code m a = some a₁) : asteps code (m + n) a = asteps code n a₁ := by
+  induction m generalizing a with
+  | zero => simp [asteps] at h; subst h; simp
+  | succ m ih =>
+    simp only [asteps] at h
+    cases hs : astep code a with
+    | halt => simp [hs] at h
+    | trap => simp [hs] at h
+    | next a₂ =>
+      simp [hs] at h
+      rw [show m + 1 + n = (m + n) + 1 by omega]
+      simp [asteps, hs, ih a₂ h]
+
+theorem halt_sim (p : List Instr) (s : SState) (a : AState)
+    (hs : sstep p s = .halt) (hr : Rel s a) : astep (compile p) a = .halt := by
+  unfold sstep at hs
+  cases hins : p[s.pc]? with
+  | none =>
+    have hlen : p.length ≤ s.pc := by
+      simpa [List.getElem?_eq_none_iff] using hins
+    have : (compile p).length ≤ a.pc := by rw [compile_length, hr.1]; omega
+    simp [astep, List.getElem?_eq_none this]
+  | some ins =>
+    exfalso
+    rw [hins] at hs
+    cases ins with
+    | assign x e =>
+      simp only at hs
+      split at hs <;> simp at hs
+    | ifnz a t => simp at hs
+    | print a => simp at hs
+
+/-- Forward simulation for terminating, UB-free runs. -/
+theorem sim_halt (p : List Instr) (s s' : SState) (a : AState)
+    (h : SHalts p s s') (hr : Rel s a) :
+    ∃ a', AHalts (compile p) a a' ∧ Rel s' a' := by
+  induction h generalizing a with
+  | done hs => exact ⟨a, ⟨0, rfl, halt_sim p _ a hs hr⟩, hr⟩
+  | step hs _ ih =>
+    obtain ⟨a₁, h5, hr₁⟩ := sim_step p _ _ a hs hr
+    obtain ⟨a₂, ⟨n, hn, hhalt⟩, hr₂⟩ := ih a₁ hr₁
+    exact ⟨a₂, ⟨5 + n, by rw [asteps_add _ 5 n a a₁ h5]; exact hn, hhalt⟩, hr₂⟩
+
+/-- **Top-level theorem.** If the source program terminates without undefined
+    behaviour, producing final memory `env'` and printed output `out'`, then the
+    compiled x86-64 code (started at address 0 with the same memory, empty log)
+    terminates without faulting, with the same memory and the same output. -/
+theorem compile_correct (p : List Instr) (env env' : Nat → W) (pc' : Nat) (out' : List W)
+    (a : AState) (h0 : a.pc = 0) (hm : a.mem = env) (ho : a.out = [])
+    (h : SHalts p ⟨env, 0, []⟩ ⟨env', pc', out'⟩) :
+    ∃ a', AHalts (compile p) a a' ∧ a'.mem = env' ∧ a'.out = out' := by
+  obtain ⟨a', hh, hr⟩ := sim_halt p _ _ a h ⟨by simp [h0], hm, ho⟩
+  exact ⟨a', hh, hr.2.1, hr.2.2⟩
+
+/-! ## Sanity check: print 100/7, then count down 3,2,1 printing each -/
+def demo : List Instr :=
+  [ .assign 0 (.div (.const 100) (.const 7)), .print (.var 0),     -- prints 14
+    .assign 1 (.atom (.const 3)),
+    .print (.var 1), .assign 1 (.sub (.var 1) (.const 1)), .ifnz (.var 1) 3 ]  -- prints 3,2,1
+
+def runSrc (p : List Instr) : Nat → SState → Option SState
+  | 0, s => some s
+  | n+1, s => match sstep p s with | .next s' => runSrc p n s' | .halt => some s | .ub => none
+def runAsm (c : List AInstr) : Nat → AState → Option AState
+  | 0, a => some a
+  | n+1, a => match astep c a with | .next a' => runAsm c n a' | .halt => some a | .trap => none
+
+#eval (runSrc demo 100 ⟨fun _ => 0, 0, []⟩).map (·.out.map BitVec.toNat)
+#eval (runAsm (compile demo) 500 ⟨0,0,0,0,false, fun _ => 0, [], 0⟩).map (·.out.map BitVec.toNat)
+-- division by zero is UB in the source and a #DE trap on the machine
+#eval (runSrc [.assign 0 (.div (.const 1) (.const 0))] 5 ⟨fun _ => 0, 0, []⟩).isNone
+#eval (runAsm (compile [.assign 0 (.div (.const 1) (.const 0))]) 20 ⟨0,0,0,0,false, fun _ => 0, [], 0⟩).isNone
+#print axioms compile_correct
