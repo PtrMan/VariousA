@@ -1,8 +1,10 @@
+import Std.Tactic.BVDecide
+
 /-!
 # Verified compilation v2: C-like language → x86-64 subset
 
 Source ("C with goto"):
-    x = a;   x = a + b;   x = a - b;   x = a / b;
+    x = a;   x = a + b;   x = a - b;   x = a * b;   x = a / b;   x = a < b;
     if (a != 0) goto L;   print(a);
 Operands `a`,`b` are variables or 64-bit constants. +,- wrap (like -fwrapv).
 Signed `/` truncates toward zero; division by 0 and INT_MIN / -1 are
@@ -35,6 +37,14 @@ def idivW (hi lo d : W) : Option (W × W) :=
   if d.toInt = 0 ∨ ¬ fits (n.tdiv d.toInt) then none
   else some (BitVec.ofInt 64 (n.tdiv d.toInt), BitVec.ofInt 64 (n.tmod d.toInt))
 
+/-- x86 flags after `cmp d, s` (i.e. computing d - s): SF and OF. -/
+def sfW (a b : W) : Bool := (a - b).msb
+def ofW (a b : W) : Bool := (a.msb != b.msb) && (a.msb != (a - b).msb)
+
+/-- `setl` condition (SF ≠ OF) is exactly signed less-than. -/
+theorem slt_flags (a b : W) : (sfW a b != ofW a b) = a.slt b := by
+  unfold sfW ofW; bv_decide
+
 /-! ## Source language -/
 
 inductive Atom where
@@ -45,7 +55,9 @@ inductive Expr where
   | atom (a : Atom)
   | add (a b : Atom)
   | sub (a b : Atom)
+  | mul (a b : Atom)
   | div (a b : Atom)
+  | lt  (a b : Atom)      -- signed a < b, yields 1 or 0 as in C
 
 inductive Instr where
   | assign (x : Nat) (e : Expr)     -- x = e;
@@ -66,7 +78,9 @@ def Expr.eval (env : Nat → W) : Expr → Option W
   | .atom a  => some (a.eval env)
   | .add a b => some (a.eval env + b.eval env)
   | .sub a b => some (a.eval env - b.eval env)
+  | .mul a b => some (a.eval env * b.eval env)
   | .div a b => divW (a.eval env) (b.eval env)
+  | .lt a b  => some (if (a.eval env).slt (b.eval env) then 1 else 0)
 
 def Function.upd (f : Nat → W) (x : Nat) (v : W) : Nat → W :=
   fun y => if y = x then v else f y
@@ -103,6 +117,9 @@ inductive AInstr where
   | movStore (slot : Nat) (r : Reg)
   | add      (d s : Reg)
   | sub      (d s : Reg)
+  | imul     (d s : Reg)
+  | cmp      (d s : Reg)            -- sets ZF, SF, OF from d - s
+  | setl     (r : Reg)              -- setl al; movzx r, al   (r := SF≠OF ? 1 : 0)
   | test     (r : Reg)
   | jnz      (target : Nat)
   | cqo
@@ -116,6 +133,8 @@ structure AState where
   rdx : W
   rdi : W
   zf  : Bool
+  sf  : Bool
+  of  : Bool
   mem : Nat → W
   out : List W
   pc  : Nat
@@ -142,6 +161,11 @@ def astep (code : List AInstr) (a : AState) : AStep :=
   | some (.movStore s r) => .next { a with mem := Function.upd a.mem s (a.get r), pc := a.pc + 1 }
   | some (.add d s)      => .next { a.set d (a.get d + a.get s) with pc := a.pc + 1 }
   | some (.sub d s)      => .next { a.set d (a.get d - a.get s) with pc := a.pc + 1 }
+  | some (.imul d s)     => .next { a.set d (a.get d * a.get s) with pc := a.pc + 1 }
+  | some (.cmp d s)      => .next { a with zf := (a.get d - a.get s == 0),
+                                           sf := sfW (a.get d) (a.get s),
+                                           of := ofW (a.get d) (a.get s), pc := a.pc + 1 }
+  | some (.setl r)       => .next { a.set r (if (a.sf != a.of) = true then 1 else 0) with pc := a.pc + 1 }
   | some (.test r)       => .next { a with zf := (a.get r == 0), pc := a.pc + 1 }
   | some (.jnz t)        => .next { a with pc := if a.zf = false then t else a.pc + 1 }
   | some .cqo            => .next { a with rdx := cqoW a.rax, pc := a.pc + 1 }
@@ -174,6 +198,8 @@ def block : Instr → List AInstr
   | .assign x (.atom a)  => [loadAtom .rax a, .nop, .nop, .nop, .movStore x .rax]
   | .assign x (.add a b) => [loadAtom .rax a, loadAtom .rcx b, .add .rax .rcx, .nop, .movStore x .rax]
   | .assign x (.sub a b) => [loadAtom .rax a, loadAtom .rcx b, .sub .rax .rcx, .nop, .movStore x .rax]
+  | .assign x (.mul a b) => [loadAtom .rax a, loadAtom .rcx b, .imul .rax .rcx, .nop, .movStore x .rax]
+  | .assign x (.lt a b)  => [loadAtom .rax a, loadAtom .rcx b, .cmp .rax .rcx, .setl .rax, .movStore x .rax]
   | .assign x (.div a b) => [loadAtom .rax a, loadAtom .rcx b, .cqo, .idiv .rcx, .movStore x .rax]
   | .ifnz a t            => [loadAtom .rax a, .nop, .nop, .test .rax, .jnz (5 * t)]
   | .print a             => [loadAtom .rdi a, .nop, .nop, .nop, .callPrint]
@@ -246,7 +272,7 @@ theorem sim_step (p : List Instr) (s s' : SState) (a : AState)
     (hs : sstep p s = .next s') (hr : Rel s a) :
     ∃ a', asteps (compile p) 5 a = some a' ∧ Rel s' a' := by
   unfold sstep at hs
-  rcases a with ⟨ra, rc, rd, ri, zf, mem, out, pc⟩
+  rcases a with ⟨ra, rc, rd, ri, zf, sf, of, mem, out, pc⟩
   obtain ⟨hpc, hmem, hout⟩ := hr
   simp only at hpc hmem hout
   subst hpc hmem hout
@@ -276,6 +302,14 @@ theorem sim_step (p : List Instr) (s s' : SState) (a : AState)
         simp [Expr.eval] at hs; subst hs
         cases at1 <;> cases at2 <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
         simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get] <;> omega
+      | mul at1 at2 =>
+        simp [Expr.eval] at hs; subst hs
+        cases at1 <;> cases at2 <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+        simp [asteps, astep, h0, h1, h2, h3, h4, Rel, Atom.eval, AState.set, AState.get] <;> omega
+      | lt at1 at2 =>
+        simp [Expr.eval] at hs; subst hs
+        cases at1 <;> cases at2 <;> simp [block, loadAtom] at h0 h1 h2 h3 h4 <;>
+        simp [asteps, astep, h0, h1, h2, h3, h4, slt_flags, Rel, Atom.eval, AState.set, AState.get] <;> omega
       | div at1 at2 =>
         cases hd : divW (at1.eval s.env) (at2.eval s.env) with
         | none => simp [Expr.eval, hd] at hs
@@ -352,11 +386,17 @@ theorem compile_correct (p : List Instr) (env env' : Nat → W) (pc' : Nat) (out
   obtain ⟨a', hh, hr⟩ := sim_halt p _ _ a h ⟨by simp [h0], hm, ho⟩
   exact ⟨a', hh, hr.2.1, hr.2.2⟩
 
-/-! ## Sanity check: print 100/7, then count down 3,2,1 printing each -/
-def demo : List Instr :=
-  [ .assign 0 (.div (.const 100) (.const 7)), .print (.var 0),     -- prints 14
-    .assign 1 (.atom (.const 3)),
-    .print (.var 1), .assign 1 (.sub (.var 1) (.const 1)), .ifnz (.var 1) 3 ]  -- prints 3,2,1
+/-! ## Sanity check: the program
+      x = 5; x = x * 5; y = x; t = x < y; if (t) goto z; x = 1; z: print(x)
+    (x=0, y=1, t=2; `z` is index 6) -/
+def prog : List Instr :=
+  [ .assign 0 (.atom (.const 5)),
+    .assign 0 (.mul (.var 0) (.const 5)),
+    .assign 1 (.atom (.var 0)),
+    .assign 2 (.lt (.var 0) (.var 1)),
+    .ifnz (.var 2) 6,
+    .assign 0 (.atom (.const 1)),
+    .print (.var 0) ]
 
 def runSrc (p : List Instr) : Nat → SState → Option SState
   | 0, s => some s
@@ -364,10 +404,18 @@ def runSrc (p : List Instr) : Nat → SState → Option SState
 def runAsm (c : List AInstr) : Nat → AState → Option AState
   | 0, a => some a
   | n+1, a => match astep c a with | .next a' => runAsm c n a' | .halt => some a | .trap => none
+def a0 : AState := ⟨0,0,0,0,false,false,false, fun _ => 0, [], 0⟩
 
-#eval (runSrc demo 100 ⟨fun _ => 0, 0, []⟩).map (·.out.map BitVec.toNat)
-#eval (runAsm (compile demo) 500 ⟨0,0,0,0,false, fun _ => 0, [], 0⟩).map (·.out.map BitVec.toNat)
--- division by zero is UB in the source and a #DE trap on the machine
+#eval (runSrc prog 100 ⟨fun _ => 0, 0, []⟩).map fun s => (s.out.map BitVec.toNat, (s.env 0).toNat)
+#eval (runAsm (compile prog) 500 a0).map fun a => (a.out.map BitVec.toNat, (a.mem 0).toNat)
+-- signed comparison with negatives: (-3 < 2) = 1, (2 < -3) = 0, (-1 < -1) = 0
+def cmpProg : List Instr :=
+  [ .assign 0 (.lt (.const (-3)) (.const 2)), .print (.var 0),
+    .assign 0 (.lt (.const 2) (.const (-3))), .print (.var 0),
+    .assign 0 (.lt (.const (-1)) (.const (-1))), .print (.var 0) ]
+#eval (runSrc cmpProg 100 ⟨fun _ => 0, 0, []⟩).map (·.out.map BitVec.toNat)
+#eval (runAsm (compile cmpProg) 500 a0).map (·.out.map BitVec.toNat)
+-- division by zero: UB in source, #DE trap on the machine
 #eval (runSrc [.assign 0 (.div (.const 1) (.const 0))] 5 ⟨fun _ => 0, 0, []⟩).isNone
-#eval (runAsm (compile [.assign 0 (.div (.const 1) (.const 0))]) 20 ⟨0,0,0,0,false, fun _ => 0, [], 0⟩).isNone
+#eval (runAsm (compile [.assign 0 (.div (.const 1) (.const 0))]) 20 a0).isNone
 #print axioms compile_correct
